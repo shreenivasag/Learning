@@ -1,4 +1,4 @@
 # Learning
 
-First commit..!
+First commits..!
 Second commit..!
