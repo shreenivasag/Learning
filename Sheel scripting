@@ -1,0 +1,327 @@
+
+
+#!/bin/bash
+
+#### VARIABLES ###
+
+WHEN=""
+thedeplmt=""
+onedeployment=""
+
+DIR="$(pwd)"
+DBNOTRUNNINGVMS="${DIR}/dbnotrunningvms.txt"
+VMSDIR="${DIR}/notrunningvms"
+test -e ${VMSDIR} || mkdir ${VMSDIR}
+DBDIR="${DIR}/permdbremotedir"
+PERMDB="${DBDIR}/monitor_bosh_VMs/permdb.txt"
+RECOVDB="${DIR}/recoverdb.txt"
+
+### TO UNCOMMENT WHEN IN CONCOURSE PIPELINE CONTAINER ###
+
+echo "prepare ~/.ssh ..."
+
+mkdir -p ~/.ssh
+echo "${GIT_PKEY}" > ~/.ssh/id_rsa
+echo "$1" > ~/.ssh/id_rsa  
+# !!!!!!!!!!!!!!!!!!!!!!! TO BE REMOVE AFTER TEST
+!!!!!!!!!!!!!!!!!!!
+chown -R root:root ~/.ssh
+chmod 600 ~/.ssh/id_rsa
+chmod 700 ~/.ssh/
+echo 
+
+echo "configure iac environment..."
+cd /home/vcap
+HOME=/home/vcap . .profile
+cd "${DIR}"
+source /home/vcap/workspace/jb-toolbox/source-me
+source /home/vcap/.rvm/scripts/rvm
+echo
+echo "iac state pull"
+cd landscape
+ls -lah
+iac state pull
+ls -lah
+ls -lah state/
+echo
+echo "setting bosh environmments"
+iac -d bosh action login
+iac -d bootstrap-bosh action login
+cd ..
+bosh envs
+
+### END OF SECTION TO UNCOMMENT WHEN NEEDED ###
+
+### FUNCTIONS ###
+
+getbadstatevmsindb(){
+# Take as argument the name of a Bosh CF deployment and provide in a CSV format
+some references of the VMs of this deployment which are not in
+"running" state
+# CVS FORMAT: <deployment_name,instance,ip,process_bad_state> of DB text
+file ${DBNOTRUNNINGVMS}
+
+thedeplmt="$1"
+
+bosh -e bosh vms -d ${thedeplmt} --json | jq '.Tables[].Rows[] |
+{instance,ips,process_state} | select(.process_state != null and .process_state
+!= "running") | [.instance,.ips,.process_state]|@csv'| tr -d
+'\"|\\'| sed "s/^\(.*\)/${thedeplmt},\1/" >>
+${DBNOTRUNNINGVMS}
+}
+
+#---------------------#
+
+checkifisinpermdb()
+{
+  resp="no"
+  while read oneline
+  do
+    echo "${oneline}" | grep -q
+"$1"
+    if [ $? -eq 0 ]; then
+      resp="yes"
+      break
+    fi
+  done < ${PERMDB}.oricopy
+  echo "${resp}"
+}
+
+#---------------------#
+
+checkifisintempdb()
+{
+  rep="no"
+  while read uneline
+  do
+    echo "${uneline}" | grep -q
+"$1"
+    if [ $? -eq 0 ]; then
+      rep="yes"
+      break
+    fi
+  done <
+${DBNOTRUNNINGVMS}.oricopy
+  echo "${rep}"
+}
+
+#---------------------#
+
+addinpermdbwithflag()
+{
+  echo "$1:FIRST" >>
+${PERMDB}
+}
+
+#---------------------#
+
+addintmpdbofrecover()
+{
+  vmref=$(echo "$1" | awk -F,
+'{print $1","$2","$3}')
+  echo "${vmref}" >> ${RECOVDB}
+}
+
+#---------------------#
+
+rmflaginpermdb()
+{
+ data="$1"
+ test ! -e ${PERMDB}.tmp || rm -rf
+${PERMDB}.tmp
+ cp -p ${PERMDB} ${PERMDB}.tmp &&
+sed "s#^\(${data}\):.*#\1:NFLAG#" < ${PERMDB}.tmp >
+${PERMDB}
+}
+
+#---------------------#
+
+rmfrompermdb()
+{
+ test ! -e ${PERMDB}.tmp || rm -rf
+${PERMDB}.tmp
+ cp -p ${PERMDB} ${PERMDB}.tmp &&
+grep -v "$1" < ${PERMDB}.tmp > ${PERMDB}
+}
+
+#---------------------#
+
+rmfromtempdb()
+{
+ vmentry="$1"
+ test ! -e ${DBNOTRUNNINGVMS}.tmp || rm
+-rf ${DBNOTRUNNINGVMS}.tmp
+ cp -p ${DBNOTRUNNINGVMS}
+${DBNOTRUNNINGVMS}.tmp && grep -v "${vmentry}" <
+${DBNOTRUNNINGVMS}.tmp > ${DBNOTRUNNINGVMS}
+}
+
+### MAIN ###
+
+# Getting the Landscape name
+LANDSCAPE=$(cat ./landscape/README.md | head -1 | sed 's/^#\s*//g')
+
+# Creating a permanent DB text file of non-running VMS
+cd "${DIR}"
+git clone script permdbremotedir
+
+# Filling out the DB text file containing the deployment VMs in
+"NON-running" state. But before first remove any old existing one if
+exist:
+test ! -e ${DBNOTRUNNINGVMS} || rm -rf ${DBNOTRUNNINGVMS}
+touch ${DBNOTRUNNINGVMS}
+
+echo "Looking for the non-running Bosh VMs in the ${LANDSCAPE}
+..."
+for onedeployment in $(bosh -e bosh deployments --json | jq -r
+'.Tables[].Rows[] | .name'| uniq | sort)
+do
+     getbadstatevmsindb ${onedeployment}
+done
+WHEN=$(date +'%m-%d-%Y %H:%M:%S')
+
+### Management of the VMs data between the permanent DB ${PERMDB} and if exists
+the list of currently non-running VMs ${DBNOTRUNNINGVMS}
+
+# Looping in the list of currently non-running VMs, a copy of the original list
+is used for that
+cp ${DBNOTRUNNINGVMS} ${DBNOTRUNNINGVMS}.oricopy
+cp ${PERMDB} ${PERMDB}.oricopy
+while read onevmdata
+do
+   # checking if these VMs were among
+those already notified as non-running in previous round
+   if [[ $(checkifisinpermdb ${onevmdata})
+== "yes" ]]; then
+       datainpermdb=$(grep -h
+"${onevmdata}" ${PERMDB}.oricopy)
+       echo "${datainpermdb}" |
+grep -q "FIRST"
+       if [ $? -eq 0 ]; then
+         # remove flag in permanent DB
+that the VM was for the first time notified as non-running
+         rmflaginpermdb
+"${onevmdata}"
+       else
+         # remove VM of list to email,as
+it has already be notified by email as non-running according the permanent
+DB
+         rmfromtempdb
+"${onevmdata}"
+       fi
+   else
+     # remove VM of the list to email as
+it has been detected as non-running for the first time, to give Bosh the
+possibility to resuscitate it before alerting
+     # but add the same VM in the
+permanent DB with a flag FIRST so that next round if the VM is still
+non-running an email alert will be send about it
+     rmfromtempdb
+"${onevmdata}"
+     addinpermdbwithflag
+"${onevmdata}"
+   fi
+ done <
+${DBNOTRUNNINGVMS}.oricopy
+
+# Looping in the list of VMs in the permanent DB which contains the VMs was
+non-running the previous round, a copy of the original permanent DB will be
+used for that
+while read unevmdata
+do
+   # checking if these VMs are not among
+those currently notified as non-running, which means that they are back up and
+running
+   theflag=$(echo
+"${unevmdata}" | cut -d ':' -f2)
+   unevmdata=$(echo
+"${unevmdata}" | cut -d ':' -f1)
+   if [[ $(checkifisintempdb
+${unevmdata}) == "no" ]]; then
+      # remove the VM of the permanent DB
+of non-running VMs as it is now back up and running
+      rmfrompermdb
+"${unevmdata}"
+      # for the VM which flag is not
+FIRST, which means that it was down more than two rounds, a recovery email need
+to be sent
+      if [[ ${theflag} !=
+"FIRST" ]]; then
+         addintmpdbofrecover
+"${unevmdata}"
+      fi
+   fi
+done < ${PERMDB}.oricopy
+
+### Building of the content and title of the emails alert
+
+if [[ -s ${DBNOTRUNNINGVMS} ]]; then
+      echo "" >
+${VMSDIR}/listofvms
+      echo "From: the Concourse
+pipeline monitoring the State of Bosh VMS on ${LANDSCAPE}" >>
+${VMSDIR}/listofvms
+      echo "At: ${WHEN} UTC"
+>> ${VMSDIR}/listofvms
+      echo "The following list of
+non-running VMs was found:" >> ${VMSDIR}/listofvms
+      echo "" >>
+${VMSDIR}/listofvms
+      echo
+"DEPLOYMENT,INSTANCE,IPs,PROCESS_STATE" >>
+${VMSDIR}/listofvms
+      cat ${DBNOTRUNNINGVMS} >>
+${VMSDIR}/listofvms
+      cat ${VMSDIR}/listofvms
+      echo "${LANDSCAPE} non-running
+Bosh VMs @ ${WHEN} UTC" > ${VMSDIR}/infolandscape
+else
+      echo "No non-running Bosh VM
+found on the Landscape!"
+      echo "ls -l
+${VMSDIR}"
+      ls -l ${VMSDIR}
+fi
+
+if [[ -s ${RECOVDB} ]]; then
+      echo "" >
+${VMSDIR}/recovvms
+      echo "From: the Concourse
+pipeline monitoring the State of Bosh VMS on ${LANDSCAPE}" >>
+${VMSDIR}/recovvms
+      echo "At: ${WHEN} UTC"
+>> ${VMSDIR}/recovvms
+      echo "The following VMs are
+back up and running from previous failure:" >>
+${VMSDIR}/recovvms
+      echo "" >>
+${VMSDIR}/recovvms
+      echo
+"DEPLOYMENT,INSTANCE,IP" >> ${VMSDIR}/recovvms
+      cat ${RECOVDB} >>
+${VMSDIR}/recovvms
+      cat ${VMSDIR}/recovvms
+      echo "${LANDSCAPE} Bosh VMs
+back up and running @ ${WHEN} UTC" >
+${VMSDIR}/infolandscape4recov
+fi
+
+# some clean-up of temporary files
+test ! -e ${PERMDB}.tmp || rm -rf ${PERMDB}.tmp
+test ! -e ${PERMDB}.oricopy || rm -rf ${PERMDB}.oricopy
+test ! -e ${DBNOTRUNNINGVMS}.tmp || rm -rf ${DBNOTRUNNINGVMS}.tmp
+test ! -e ${DBNOTRUNNINGVMS}.oricopy || rm -rf ${DBNOTRUNNINGVMS}.oricopy
+
+cd ${DBDIR}
+git config --global user.email "sic@sap.com"
+git config --global user.name "sicsap"
+git add ./monitor_bosh_VMs/permdb.txt
+git commit -m "Update of permanent DB text file on ${WHEN}"
+cd ${DIR}
+
+echo ""
+echo "Content of the permanent DB recording the non-running Bosh
+VMs"
+cat ${PERMDB}
+ 
+
